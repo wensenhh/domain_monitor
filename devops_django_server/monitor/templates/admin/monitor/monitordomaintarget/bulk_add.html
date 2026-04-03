@@ -1,0 +1,79 @@
+{% extends "admin/base_site.html" %}
+{% load admin_urls %}
+
+{% block content %}
+  <div id="content-main">
+    <form method="post" novalidate>
+      {% csrf_token %}
+
+      {% if form.non_field_errors %}
+        <p class="errornote">{{ form.non_field_errors }}</p>
+      {% endif %}
+
+      <fieldset class="module aligned">
+        {% for field in form %}
+          <div class="form-row">
+            {% if field.errors %}
+              {{ field.errors }}
+            {% endif %}
+            <div>
+              {{ field.label_tag }}
+              {{ field }}
+              {% if field.help_text %}
+                <div class="help">{{ field.help_text }}</div>
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      </fieldset>
+
+      <div class="submit-row">
+        <input type="submit" value="提交" class="default">
+        <a href="{{ changelist_url }}" class="button cancel-link">返回列表</a>
+      </div>
+    </form>
+
+    {% if result %}
+      <fieldset class="module">
+        <h2>预览结果</h2>
+        <div class="form-row">
+          <div>
+            <p>有效域名：{{ result.valid_count }}</p>
+            <p>将新增：{{ result.to_create|length }}</p>
+            <p>已存在：{{ result.existing|length }}</p>
+            <p>无效：{{ result.invalid|length }}</p>
+            <p>dry_run：{{ result.dry_run }}</p>
+          </div>
+        </div>
+
+        {% if result.invalid %}
+          <div class="form-row">
+            <div>
+              <h3>无效输入</h3>
+              <pre style="white-space: pre-wrap;">{{ result.invalid|join:"\n" }}</pre>
+            </div>
+          </div>
+        {% endif %}
+
+        {% if result.to_create %}
+          <div class="form-row">
+            <div>
+              <h3>将新增的域名</h3>
+              <pre style="white-space: pre-wrap;">{{ result.to_create|join:"\n" }}</pre>
+            </div>
+          </div>
+        {% endif %}
+
+        {% if result.existing %}
+          <div class="form-row">
+            <div>
+              <h3>已存在的域名</h3>
+              <pre style="white-space: pre-wrap;">{{ result.existing|join:"\n" }}</pre>
+            </div>
+          </div>
+        {% endif %}
+      </fieldset>
+    {% endif %}
+  </div>
+{% endblock %}
+

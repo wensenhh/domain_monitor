@@ -1,74 +1,210 @@
 services:
   db:
-    image: postgres:15
+    image: postgres:15-alpine
     environment:
-      POSTGRES_DB: domainmonitor
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: "1313575799"
-      TZ: Asia/Shanghai
+      - TZ=Asia/Shanghai
     ports:
-      - "5432:5432"
-    volumes:
-      - db_data:/var/lib/postgresql/data
-  producer:
-    build: .
-    depends_on:
-      - db
+      - ${POSTGRES_DB_LISTEN_PORT}:5432
     env_file:
       - .env
-    environment:
-      DB_HOST: db
-      TZ: Asia/Shanghai
-    command: python task_producer/producer.py --batch-size 100 --loop-seconds 120
     volumes:
-      - ./screenshots:/app/screenshots
-      - ./:/app/
-  worker1:
-    build: .
-    depends_on:
-      - db
-    env_file:
-      - .env
-    environment:
-      DB_HOST: db
-      TZ: Asia/Shanghai
-    command: python task_worker/worker.py --batch-size 5 --lease-minutes 15 --poll-seconds 10 --headless
-    volumes:
-      - ./screenshots:/app/screenshots
-      - ./:/app/
+      - ./db_data:/var/lib/postgresql/data/
 
-  workeri2:
+  django-server:
     build: .
-    depends_on:
-      - db
-    env_file:
-      - .env
+    init: true      # 僵尸进程回收
     environment:
-      DB_HOST: db
-      TZ: Asia/Shanghai
-    command: python task_worker/worker.py --batch-size 5 --lease-minutes 15 --poll-seconds 10 --headless
-    volumes:
-      - ./screenshots:/app/screenshots
-      - ./:/app/
-
-        
-  admin:
-    build: .
-    depends_on:
-      - db
-    env_file:
-      - .env
-    environment:
-      DB_HOST: db
-      TZ: Asia/Shanghai
-    command: python admin_app.py
+      - TZ=Asia/Shanghai
     ports:
-      - "80:8000"
+      - ${DJANGO_SERVER_PORT}:${DJANGO_SERVER_PORT}
     volumes:
-      - ./screenshots:/app/screenshots
-      - ./:/app/
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py runserver 0.0.0.0:${DJANGO_SERVER_PORT}
 
+  monitor-producer:
+    build: .
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py producer
 
+  monitor-worker1:
+    build: .
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker
 
-volumes:
-  db_data:
+  monitor-worker2:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker
+
+  monitor-worker3:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker    
+
+  monitor-worker4:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker        
+
+  monitor-worker5:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker
+
+  monitor-worker6:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker
+
+  monitor-worker7:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker
+
+  monitor-worker8:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker    
+
+  monitor-worker9:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker    
+
+  monitor-worker10:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker
+
+  monitor-worker11:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker    
+
+  monitor-worker12:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker      
+
+  monitor-worker13:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker  
+  monitor-worker14:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker      
+
+  monitor-worker15:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker  
+
+  monitor-worker16:
+    image: vp-monitor-monitor-worker1:latest
+    init: true
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: python devops_django_server/manage.py worker      

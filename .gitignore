@@ -13,3 +13,4 @@ playwright-report/
 screenshots/
 .DS_Store
 Thumbs.db
+db_data/
