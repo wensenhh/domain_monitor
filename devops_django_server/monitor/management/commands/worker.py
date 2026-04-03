@@ -6,6 +6,7 @@ import urllib.request
 import urllib.error
 from datetime import timedelta
 import hashlib
+from urllib.parse import urlparse
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
@@ -257,16 +258,34 @@ def _run_one_check(
     timings_ms = {}
     try:
         t3 = time.monotonic()
-        results = _run_platform(
-            platform,
-            domain,
-            proxy=proxy,
-            headless=headless,
-            screenshot_enabled=screenshot_enabled,
-            screenshot_dir=screenshot_dir,
-            nav_timeout_ms=nav_timeout_ms,
-            action_timeout_ms=action_timeout_ms,
-        )
+        enabled_platforms = list(MonitorPlatform.objects.filter(enabled=True).order_by("id"))
+        candidates = [platform] + [p for p in enabled_platforms if p.id != platform.id]
+        last_err = None
+        used_platform = None
+        results = None
+        for p in candidates:
+            try:
+                results = _run_platform(
+                    p,
+                    domain,
+                    proxy=proxy,
+                    headless=headless,
+                    screenshot_enabled=screenshot_enabled,
+                    screenshot_dir=screenshot_dir,
+                    nav_timeout_ms=nav_timeout_ms,
+                    action_timeout_ms=action_timeout_ms,
+                )
+                used_platform = p
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(f"_run_one_check platform failed: domain={domain} platform={p} error={type(e).__name__}: {e}")
+        if results is None or used_platform is None:
+            raise last_err or RuntimeError("all platforms failed")
+        if used_platform.id != platform.id:
+            task.platform = used_platform
+            task.save(update_fields=["platform"])
+            platform = used_platform
         timings_ms["platform_ms"] = (time.monotonic() - t3) * 1000.0
         meta = {}
         if (
@@ -302,13 +321,16 @@ def _run_one_check(
         task.save(update_fields=["status", "count", "browser_launch_ms", "collect_ms", "insert_ms", "total_ms"])
 
         total, failed, rate = _calc_fail_rate(task)
+        task.failure_rate = float(rate)
+        task.save(update_fields=["failure_rate"])
         return task, total, failed, rate
     except Exception as e:
         task.status = "failed"
         task.error_type = type(e).__name__
         task.error_message = str(e)[:2000]
         task.total_ms = (time.monotonic() - started_at) * 1000.0
-        task.save(update_fields=["status", "error_type", "error_message", "total_ms"])
+        task.failure_rate = 1.0
+        task.save(update_fields=["status", "error_type", "error_message", "total_ms", "failure_rate"])
         return task, 0, 0, 1.0
 
 
@@ -347,8 +369,45 @@ def _select_platform(waiting_task: MonitorWaitingTask) -> MonitorPlatform:
     if not platforms:
         logger.error("没有可用的域名检测平台")
         raise RuntimeError("no enabled platform")
-    idx = waiting_task.id % len(platforms)
-    return platforms[idx]
+
+    domain = clean_domain(waiting_task.domain)
+
+    def strip_www(v: str) -> str:
+        s = (v or "").strip()
+        if s.lower().startswith("www."):
+            return s[4:]
+        if "://" in s:
+            try:
+                u = urlparse(s)
+                host = (u.hostname or "").strip()
+                if host.lower().startswith("www."):
+                    host = host[4:]
+                    port = f":{u.port}" if u.port else ""
+                    path = u.path or ""
+                    query = f"?{u.query}" if u.query else ""
+                    return f"{u.scheme}://{host}{port}{path}{query}"
+            except Exception:
+                return s
+        return s
+
+    domain_alt = strip_www(domain)
+    since = timezone.now() - timedelta(days=7)
+    blacklisted_17ce = MonitorTask.objects.filter(
+        platform__platform="17ce",
+        status="failed",
+        created_at__gte=since,
+        error_message__icontains="black list",
+    ).filter(Q(domain=domain) | Q(domain=domain_alt)).exists()
+
+    filtered: list[MonitorPlatform] = []
+    for p in platforms:
+        if (p.platform or "").strip().lower() == "17ce" and blacklisted_17ce:
+            continue
+        filtered.append(p)
+    if not filtered:
+        filtered = platforms
+    idx = waiting_task.id % len(filtered)
+    return filtered[idx]
 
 
 def _run_platform(
@@ -414,16 +473,35 @@ def _execute_task(waiting_task: MonitorWaitingTask):
     try:
         t3 = time.monotonic()
         logger.info(f"开始执行任务: {task}. 配置: platform={platform}, headless={headless}, proxy={proxy}, screenshot_enabled={screenshot_enabled}, screenshot_dir={screenshot_dir}, nav_timeout_ms={nav_timeout_ms}, action_timeout_ms={action_timeout_ms}")
-        results = _run_platform(
-            platform,
-            domain,
-            proxy=proxy,
-            headless=headless,
-            screenshot_enabled=screenshot_enabled,
-            screenshot_dir=screenshot_dir,
-            nav_timeout_ms=nav_timeout_ms,
-            action_timeout_ms=action_timeout_ms,
-        )
+        enabled_platforms = list(MonitorPlatform.objects.filter(enabled=True).order_by("id"))
+        candidates = [platform] + [p for p in enabled_platforms if p.id != platform.id]
+        last_err = None
+        used_platform = None
+        results = None
+        for p in candidates:
+            try:
+                results = _run_platform(
+                    p,
+                    domain,
+                    proxy=proxy,
+                    headless=headless,
+                    screenshot_enabled=screenshot_enabled,
+                    screenshot_dir=screenshot_dir,
+                    nav_timeout_ms=nav_timeout_ms,
+                    action_timeout_ms=action_timeout_ms,
+                )
+                used_platform = p
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(f"平台检测失败将尝试切换平台: domain={domain} platform={p} error={type(e).__name__}: {e}")
+        if results is None or used_platform is None:
+            raise last_err or RuntimeError("all platforms failed")
+        if used_platform.id != platform.id:
+            logger.info(f"已切换平台并继续执行: domain={domain} from={platform} to={used_platform}")
+            task.platform = used_platform
+            task.save(update_fields=["platform"])
+            platform = used_platform
         logger.info(f"{platform} 任务执行完成: {task}. 配置: platform={platform}, headless={headless}, proxy={proxy}, screenshot_enabled={screenshot_enabled}, screenshot_dir={screenshot_dir}, nav_timeout_ms={nav_timeout_ms}, action_timeout_ms={action_timeout_ms}")
         timings_ms["platform_ms"] = (time.monotonic() - t3) * 1000.0
         meta = {}
@@ -463,6 +541,8 @@ def _execute_task(waiting_task: MonitorWaitingTask):
         timings_ms["update_task_ms"] = (time.monotonic() - t5) * 1000.0
 
         total1, failed1, rate1 = _calc_fail_rate(task)
+        task.failure_rate = float(rate1)
+        task.save(update_fields=["failure_rate"])
         logger.info(f"首次失败率计算: domain={domain} total={total1} failed={failed1} rate={rate1:.4f} threshold={threshold}")
 
         incomplete = bool(meta.get("incomplete")) if isinstance(meta, dict) else False

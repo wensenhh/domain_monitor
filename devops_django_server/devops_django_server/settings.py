@@ -157,3 +157,5 @@ LOGGING = {
         "config": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
     },
 }
+
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 100000
