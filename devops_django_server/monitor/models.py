@@ -244,6 +244,37 @@ class MonitorDomainDiagnosis(models.Model):
     def __str__(self):
         return f"{self.domain}-{self.diagnosis_type}-{self.confidence:.2f}"
 
+    @property
+    def diagnosis_type_cn(self):
+        return {
+            self.DiagnosisType.NORMAL: "DNS 解析正常",
+            self.DiagnosisType.HTTP_ONLY_FAILURE: "HTTP 访问异常",
+            self.DiagnosisType.DNS_MISCONFIG: "DNS 配置异常",
+            self.DiagnosisType.REGISTRAR_DNS_SUSPENDED: "疑似注册商暂停解析",
+            self.DiagnosisType.REGISTRAR_HOLD: "域名注册状态 HOLD",
+            self.DiagnosisType.INCONCLUSIVE: "证据不足",
+        }.get(self.diagnosis_type, self.diagnosis_type or "-")
+
+    @property
+    def diagnosis_summary(self):
+        # 诊断记录关注 DNS/注册商层，不等同于 HTTP 路径状态；例如 /not-exist 返回 404 时，DNS 仍可能是正常的。
+        evidence = self.evidence or {}
+        failures = sorted(set(evidence.get("address_failures") or []))
+        ns_names = evidence.get("ns_names") or []
+        if self.diagnosis_type == self.DiagnosisType.NORMAL:
+            return "域名可正常解析；若页面显示 Not Found，通常是 HTTP 路径/站点内容返回 404，不是 DNS 暂停解析。"
+        if self.diagnosis_type == self.DiagnosisType.HTTP_ONLY_FAILURE:
+            return "DNS 可解析，但 HTTP 检测节点存在失败，建议检查 Web 服务、路径、证书或源站。"
+        if self.diagnosis_type == self.DiagnosisType.REGISTRAR_DNS_SUSPENDED:
+            ns_text = "、".join(ns_names[:4]) or "-"
+            return f"多解析器失败且命中注册商 NS 规则，疑似注册商暂停解析；NS={ns_text}。"
+        if self.diagnosis_type == self.DiagnosisType.REGISTRAR_HOLD:
+            return "RDAP/WHOIS 状态存在 clientHold/serverHold/inactive，域名注册状态可能导致解析不可用。"
+        if self.diagnosis_type == self.DiagnosisType.DNS_MISCONFIG:
+            fail_text = "、".join(failures) or "-"
+            return f"多解析器 DNS 查询失败，未命中特定注册商规则；失败类型={fail_text}。"
+        return "DNS/RDAP 证据不足，暂不做确定性判断。"
+
 
 class MonitorPlatformCooldown(models.Model):
     platform = models.OneToOneField(

@@ -281,12 +281,22 @@ class MonitorDomainDiagnosisAdmin(admin.ModelAdmin):
         "domain",
         "target",
         "task",
-        "diagnosis_type",
+        "diagnosis_type_cn",
         "confidence",
+        "diagnosis_summary",
         "created_at",
     )
     list_filter = ("diagnosis_type",)
     search_fields = ("domain",)
+    readonly_fields = ("diagnosis_type_cn", "diagnosis_summary", "created_at")
+
+    @admin.display(description="诊断类型")
+    def diagnosis_type_cn(self, obj):
+        return obj.diagnosis_type_cn
+
+    @admin.display(description="诊断说明")
+    def diagnosis_summary(self, obj):
+        return obj.diagnosis_summary
 
 
 @admin.register(MonitorPlatformCooldown)
