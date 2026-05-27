@@ -1,4 +1,5 @@
 import time
+import hashlib
 from datetime import timedelta
 
 from django.core.management.base import BaseCommand
@@ -25,16 +26,27 @@ def get_int(key: str, default: int) -> int:
     return default
 
 
-def is_due(target: MonitorDomainTarget, now) -> bool:
+def _target_jitter_seconds(domain: str, max_seconds: int) -> int:
+    if max_seconds <= 0:
+        return 0
+    h = hashlib.md5(str(domain or "").encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % max_seconds
+
+
+def is_due(target: MonitorDomainTarget, now, *, min_interval_minutes: int, jitter_seconds: int) -> bool:
     if not target.last_scheduled_at:
         return True
-    minutes = target.schedule_interval_minutes
-    return now >= target.last_scheduled_at + timedelta(minutes=minutes)
+    minutes = max(int(target.schedule_interval_minutes or 0), int(min_interval_minutes or 0), 1)
+    # 固定域名抖动用于错开大量目标的调度时间，避免 worker 同时打第三方平台导致频控或封禁。
+    jitter = _target_jitter_seconds(target.domain, max(0, int(jitter_seconds or 0)))
+    return now >= target.last_scheduled_at + timedelta(minutes=minutes, seconds=jitter)
 
 
 def enqueue_once() -> int:
     now = timezone.now()
     enqueued = 0
+    min_interval_minutes = get_int("MIN_TARGET_INTERVAL_MINUTES", 10)
+    jitter_seconds = get_int("PRODUCER_SCHEDULE_JITTER_SECONDS", 60)
 
     with transaction.atomic():
         active_target_ids = set(
@@ -54,7 +66,7 @@ def enqueue_once() -> int:
             if not cleaned:
                 logger.info(f"跳过空域名目标: id={target.id} domain={target.domain!r}")
                 continue
-            if not is_due(target, now):
+            if not is_due(target, now, min_interval_minutes=min_interval_minutes, jitter_seconds=jitter_seconds):
                 logger.debug(f"目标 {target} 未到执行时间")
                 continue
 

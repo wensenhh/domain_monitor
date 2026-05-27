@@ -194,3 +194,78 @@ class MonitorAlertedDomais(models.Model):
         verbose_name_plural = "告警域名"
     def __str__(self):
         return f"{self.domain}-{self.alert_type}-{self.alert_message}"
+
+
+class MonitorDomainDiagnosis(models.Model):
+    class DiagnosisType(models.TextChoices):
+        NORMAL = "normal", "normal"
+        HTTP_ONLY_FAILURE = "http_only_failure", "http_only_failure"
+        DNS_MISCONFIG = "dns_misconfig", "dns_misconfig"
+        REGISTRAR_DNS_SUSPENDED = "registrar_dns_suspended", "registrar_dns_suspended"
+        REGISTRAR_HOLD = "registrar_hold", "registrar_hold"
+        INCONCLUSIVE = "inconclusive", "inconclusive"
+
+    domain = models.CharField(verbose_name="诊断域名", blank=False, null=False, max_length=255, help_text="诊断域名")
+    target = models.ForeignKey(
+        MonitorDomainTarget,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column="target_id",
+        related_name="diagnoses",
+    )
+    task = models.ForeignKey(
+        MonitorTask,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column="task_id",
+        related_name="diagnoses",
+    )
+    diagnosis_type = models.CharField(
+        max_length=64,
+        choices=DiagnosisType.choices,
+        verbose_name="诊断类型",
+        help_text="诊断类型",
+    )
+    confidence = models.FloatField(default=0.0, verbose_name="置信度", help_text="0~1")
+    evidence = models.JSONField(null=True, blank=True, verbose_name="诊断证据", help_text="DNS/RDAP/平台复测证据")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+
+    class Meta:
+        db_table = "monitor_domain_diagnoses"
+        indexes = [
+            models.Index(fields=["domain", "created_at"], name="idx_mdiag_domain_created"),
+            models.Index(fields=["diagnosis_type", "created_at"], name="idx_mdiag_type_created"),
+        ]
+        verbose_name = "域名诊断记录"
+        verbose_name_plural = "域名诊断记录"
+
+    def __str__(self):
+        return f"{self.domain}-{self.diagnosis_type}-{self.confidence:.2f}"
+
+
+class MonitorPlatformCooldown(models.Model):
+    platform = models.OneToOneField(
+        MonitorPlatform,
+        on_delete=models.CASCADE,
+        db_column="platform_id",
+        related_name="cooldown",
+    )
+    cooldown_until = models.DateTimeField(null=True, blank=True, verbose_name="冷却截止时间", help_text="平台冷却截止时间")
+    consecutive_failures = models.IntegerField(default=0, verbose_name="连续平台失败次数", help_text="连续平台失败次数")
+    reason = models.CharField(max_length=255, null=True, blank=True, verbose_name="冷却原因", help_text="冷却原因")
+    last_error_type = models.CharField(max_length=255, null=True, blank=True, verbose_name="最后错误类型", help_text="最后错误类型")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        db_table = "monitor_platform_cooldowns"
+        indexes = [
+            models.Index(fields=["cooldown_until"], name="idx_mpc_cooldown_until"),
+        ]
+        verbose_name = "平台冷却状态"
+        verbose_name_plural = "平台冷却状态"
+
+    def __str__(self):
+        return f"{self.platform}-{self.consecutive_failures}-{self.cooldown_until}"

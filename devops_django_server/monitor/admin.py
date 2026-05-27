@@ -5,7 +5,17 @@ from django.shortcuts import redirect, render
 from django.urls import path, reverse
 
 # Register your models here.
-from .models import MonitorDomainTarget,MonitorWaitingTask,MonitorPlatform,MonitorDomainResult,MonitorTask,MonitorConfig, MonitorAlertedDomais
+from .models import (
+    MonitorAlertedDomais,
+    MonitorConfig,
+    MonitorDomainDiagnosis,
+    MonitorDomainResult,
+    MonitorDomainTarget,
+    MonitorPlatform,
+    MonitorPlatformCooldown,
+    MonitorTask,
+    MonitorWaitingTask,
+)
 from .domain_utils import clean_domain
 
 
@@ -262,3 +272,32 @@ class MonitorAlertedDomaisAdmin(admin.ModelAdmin):
         "alert_type",
         "alert_message",
     )
+
+
+@admin.register(MonitorDomainDiagnosis)
+class MonitorDomainDiagnosisAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "domain",
+        "target",
+        "task",
+        "diagnosis_type",
+        "confidence",
+        "created_at",
+    )
+    list_filter = ("diagnosis_type",)
+    search_fields = ("domain",)
+
+
+@admin.register(MonitorPlatformCooldown)
+class MonitorPlatformCooldownAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "platform",
+        "cooldown_until",
+        "consecutive_failures",
+        "reason",
+        "last_error_type",
+        "updated_at",
+    )
+    search_fields = ("platform__platform", "reason", "last_error_type")

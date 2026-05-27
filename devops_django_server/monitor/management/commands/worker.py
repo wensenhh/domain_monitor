@@ -2,6 +2,7 @@ import os
 import re
 import time
 import json
+import random
 import urllib.request
 import urllib.error
 from datetime import timedelta
@@ -14,11 +15,14 @@ from django.db.models import Q
 from django.utils import timezone
 
 from monitor.domain_utils import clean_domain
+from monitor.dns_diagnosis import diagnose_domain
 from monitor.models import (
     MonitorConfig,
     MonitorAlertedDomais,
+    MonitorDomainDiagnosis,
     MonitorDomainResult,
     MonitorPlatform,
+    MonitorPlatformCooldown,
     MonitorTask,
     MonitorWaitingTask,
 )
@@ -83,6 +87,18 @@ def _get_str(key: str, default: str) -> str:
     if s.startswith("`") and s.endswith("`") and len(s) >= 2:
         s = s[1:-1].strip()
     return s
+
+
+def _get_json(key: str, default):
+    v = _get_config(key)
+    if v is None:
+        return default
+    if isinstance(v, (dict, list)):
+        return v
+    try:
+        return json.loads(str(v))
+    except Exception:
+        return default
 
 
 def _is_success_status_code(status_code) -> bool:
@@ -221,8 +237,201 @@ def _format_alert_message(
     )
 
 
-def _select_retest_platform(primary: MonitorPlatform, domain: str) -> MonitorPlatform:
+def _format_registrar_alert_message(domain: str, diagnosis: MonitorDomainDiagnosis):
+    ts = timezone.localtime(timezone.now()).strftime("%Y-%m-%d %H:%M:%S")
+    evidence = diagnosis.evidence or {}
+    ns_names = ", ".join((evidence.get("ns_names") or [])[:6]) or "-"
+    failures = ", ".join(sorted(set(evidence.get("address_failures") or []))) or "-"
+    title = "域名注册商暂停解析/注册状态异常"
+    if diagnosis.diagnosis_type == MonitorDomainDiagnosis.DiagnosisType.REGISTRAR_HOLD:
+        title = "域名注册状态 HOLD，解析服务不可用"
+    return (
+        f"🔥🔥🔥报警实例:  {domain}\n\n"
+        f"名称: {title}\n"
+        f"时间: {ts}\n"
+        f"级别： Critical\n"
+        f"状态: PROBLEM\n"
+        f"详情: {domain} DNS 诊断={diagnosis.diagnosis_type}, 置信度={diagnosis.confidence:.2f}, "
+        f"NS={ns_names}, DNS失败={failures}"
+    )
+
+
+def _is_platform_backoff_error(e: Exception) -> bool:
+    s = str(e).lower()
+    keywords = [
+        "black list",
+        "blacklist",
+        "429",
+        "too many",
+        "rate limit",
+        "captcha",
+        "verify",
+        "验证",
+        "访问量较大",
+        "timeout",
+        "timed out",
+        "proxy",
+        "tunnel",
+        "websocket login timeout",
+        "results empty",
+        "input not found",
+        "button not found",
+    ]
+    return any(k in s for k in keywords)
+
+
+def _is_platform_available(platform: MonitorPlatform, now=None) -> bool:
+    now = now or timezone.now()
+    cooldown = getattr(platform, "cooldown", None)
+    if not cooldown or not cooldown.cooldown_until:
+        return True
+    return cooldown.cooldown_until <= now
+
+
+def _enabled_platforms_for_domain(domain: str) -> list[MonitorPlatform]:
+    now = timezone.now()
     platforms = list(MonitorPlatform.objects.filter(enabled=True).order_by("id"))
+    available = [p for p in platforms if _is_platform_available(p, now=now)]
+    if not available:
+        logger.warning("所有检测平台都在冷却中，本轮允许使用原始平台列表，避免任务永久饥饿")
+        available = platforms
+
+    def strip_www(v: str) -> str:
+        s = (v or "").strip()
+        if s.lower().startswith("www."):
+            return s[4:]
+        if "://" in s:
+            try:
+                u = urlparse(s)
+                host = (u.hostname or "").strip()
+                if host.lower().startswith("www."):
+                    host = host[4:]
+                    port = f":{u.port}" if u.port else ""
+                    path = u.path or ""
+                    query = f"?{u.query}" if u.query else ""
+                    return f"{u.scheme}://{host}{port}{path}{query}"
+            except Exception:
+                return s
+        return s
+
+    domain_alt = strip_www(domain)
+    since = now - timedelta(days=7)
+    blacklisted_17ce = MonitorTask.objects.filter(
+        platform__platform="17ce",
+        status="failed",
+        created_at__gte=since,
+        error_message__icontains="black list",
+    ).filter(Q(domain=domain) | Q(domain=domain_alt)).exists()
+
+    filtered: list[MonitorPlatform] = []
+    for p in available:
+        if (p.platform or "").strip().lower() == "17ce" and blacklisted_17ce:
+            continue
+        filtered.append(p)
+    return filtered or available
+
+
+def _mark_platform_success(platform: MonitorPlatform):
+    try:
+        MonitorPlatformCooldown.objects.update_or_create(
+            platform=platform,
+            defaults={
+                "cooldown_until": None,
+                "consecutive_failures": 0,
+                "reason": "",
+                "last_error_type": "",
+            },
+        )
+    except Exception as e:
+        logger.warning(f"更新平台成功冷却状态失败: platform={platform} error={e}")
+
+
+def _mark_platform_failure(platform: MonitorPlatform, e: Exception):
+    if not _is_platform_backoff_error(e):
+        return
+    base_seconds = max(1, _get_int("PLATFORM_BACKOFF_BASE_SECONDS", 60))
+    max_seconds = max(base_seconds, _get_int("PLATFORM_BACKOFF_MAX_SECONDS", 1800))
+    try:
+        cooldown, _created = MonitorPlatformCooldown.objects.get_or_create(platform=platform)
+        failures = int(cooldown.consecutive_failures or 0) + 1
+        delay = min(max_seconds, base_seconds * (2 ** min(failures - 1, 8)))
+        delay = int(delay + random.uniform(0, max(1, delay * 0.2)))
+        # 这里的退避只针对“平台/代理/频控”异常，不代表域名故障；冷却平台可以减少第三方 API 频控和页面验证码。
+        cooldown.consecutive_failures = failures
+        cooldown.cooldown_until = timezone.now() + timedelta(seconds=delay)
+        cooldown.reason = str(e)[:255]
+        cooldown.last_error_type = type(e).__name__[:255]
+        cooldown.save(update_fields=["consecutive_failures", "cooldown_until", "reason", "last_error_type", "updated_at"])
+        logger.warning(
+            f"检测平台进入退避冷却: platform={platform} failures={failures} delay={delay}s error={type(e).__name__}: {e}"
+        )
+    except Exception as save_err:
+        logger.warning(f"更新平台退避冷却状态失败: platform={platform} error={save_err}")
+
+
+def _sleep_confirm_delay(base_seconds: int):
+    if base_seconds <= 0:
+        return
+    delay = base_seconds + random.uniform(0, max(1, base_seconds * 0.2))
+    logger.info(f"异常确认前等待 {delay:.1f}s，加入抖动避免大量域名同时复测触发平台频控")
+    time.sleep(delay)
+
+
+def _run_dns_diagnosis(domain: str, waiting_task: MonitorWaitingTask, task: MonitorTask) -> MonitorDomainDiagnosis | None:
+    if not _get_bool("DNS_CHECK_ENABLED", True):
+        return None
+
+    resolvers = _get_json("DNS_RESOLVERS", ["223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"])
+    if not isinstance(resolvers, list):
+        resolvers = ["223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"]
+    registrar_patterns = _get_json("REGISTRAR_NS_RULES", ["juming", "juming.com", "jumingdns.com"])
+    if not isinstance(registrar_patterns, list):
+        registrar_patterns = ["juming", "juming.com", "jumingdns.com"]
+    timeout_seconds = _get_float("DNS_QUERY_TIMEOUT_SECONDS", 2.0)
+    rounds = max(1, _get_int("DNS_CONFIRM_ROUNDS", 2))
+    confirm_delay = max(0, _get_int("DNS_CONFIRM_DELAY_SECONDS", 5))
+    rdap_enabled = _get_bool("RDAP_ENABLED", False)
+
+    last_result = None
+    for idx in range(rounds):
+        if idx > 0:
+            _sleep_confirm_delay(confirm_delay)
+        try:
+            last_result = diagnose_domain(
+                domain,
+                resolvers=resolvers,
+                registrar_ns_patterns=registrar_patterns,
+                timeout_seconds=timeout_seconds,
+                rdap_enabled=rdap_enabled,
+                rdap_timeout_seconds=_get_int("RDAP_TIMEOUT_SECONDS", 5),
+            )
+            logger.info(
+                f"DNS 诊断完成: domain={domain} round={idx + 1}/{rounds} "
+                f"type={last_result.diagnosis_type} confidence={last_result.confidence:.2f}"
+            )
+        except Exception as e:
+            # DNS 诊断自身异常时不能直接告警，记录 inconclusive，继续走平台复测以降低误报。
+            logger.warning(f"DNS 诊断异常: domain={domain} round={idx + 1}/{rounds} error={type(e).__name__}: {e}")
+            last_result = None
+
+    if not last_result:
+        return None
+    try:
+        return MonitorDomainDiagnosis.objects.create(
+            domain=domain,
+            target=waiting_task.target,
+            task=task,
+            diagnosis_type=last_result.diagnosis_type,
+            confidence=float(last_result.confidence),
+            evidence=last_result.evidence,
+        )
+    except Exception as e:
+        logger.warning(f"保存 DNS 诊断结果失败: domain={domain} error={e}")
+        return None
+
+
+def _select_retest_platform(primary: MonitorPlatform, domain: str) -> MonitorPlatform:
+    platforms = _enabled_platforms_for_domain(domain)
     if len(platforms) <= 1:
         return primary
     others = [p for p in platforms if p.id != primary.id]
@@ -258,7 +467,7 @@ def _run_one_check(
     timings_ms = {}
     try:
         t3 = time.monotonic()
-        enabled_platforms = list(MonitorPlatform.objects.filter(enabled=True).order_by("id"))
+        enabled_platforms = _enabled_platforms_for_domain(domain)
         candidates = [platform] + [p for p in enabled_platforms if p.id != platform.id]
         last_err = None
         used_platform = None
@@ -276,9 +485,11 @@ def _run_one_check(
                     action_timeout_ms=action_timeout_ms,
                 )
                 used_platform = p
+                _mark_platform_success(p)
                 break
             except Exception as e:
                 last_err = e
+                _mark_platform_failure(p, e)
                 logger.warning(f"_run_one_check platform failed: domain={domain} platform={p} error={type(e).__name__}: {e}")
         if results is None or used_platform is None:
             raise last_err or RuntimeError("all platforms failed")
@@ -363,51 +574,15 @@ def _claim_task(worker_id: str, lease_seconds: int) -> MonitorWaitingTask | None
 
 
 def _select_platform(waiting_task: MonitorWaitingTask) -> MonitorPlatform:
-    platforms = list(MonitorPlatform.objects.filter(enabled=True).order_by("id"))
+    domain = clean_domain(waiting_task.domain)
+    platforms = _enabled_platforms_for_domain(domain)
     logger.info(f"当前可用域名检测平台: {platforms}")
 
     if not platforms:
         logger.error("没有可用的域名检测平台")
         raise RuntimeError("no enabled platform")
-
-    domain = clean_domain(waiting_task.domain)
-
-    def strip_www(v: str) -> str:
-        s = (v or "").strip()
-        if s.lower().startswith("www."):
-            return s[4:]
-        if "://" in s:
-            try:
-                u = urlparse(s)
-                host = (u.hostname or "").strip()
-                if host.lower().startswith("www."):
-                    host = host[4:]
-                    port = f":{u.port}" if u.port else ""
-                    path = u.path or ""
-                    query = f"?{u.query}" if u.query else ""
-                    return f"{u.scheme}://{host}{port}{path}{query}"
-            except Exception:
-                return s
-        return s
-
-    domain_alt = strip_www(domain)
-    since = timezone.now() - timedelta(days=7)
-    blacklisted_17ce = MonitorTask.objects.filter(
-        platform__platform="17ce",
-        status="failed",
-        created_at__gte=since,
-        error_message__icontains="black list",
-    ).filter(Q(domain=domain) | Q(domain=domain_alt)).exists()
-
-    filtered: list[MonitorPlatform] = []
-    for p in platforms:
-        if (p.platform or "").strip().lower() == "17ce" and blacklisted_17ce:
-            continue
-        filtered.append(p)
-    if not filtered:
-        filtered = platforms
-    idx = waiting_task.id % len(filtered)
-    return filtered[idx]
+    idx = waiting_task.id % len(platforms)
+    return platforms[idx]
 
 
 def _run_platform(
@@ -473,7 +648,7 @@ def _execute_task(waiting_task: MonitorWaitingTask):
     try:
         t3 = time.monotonic()
         logger.info(f"开始执行任务: {task}. 配置: platform={platform}, headless={headless}, proxy={proxy}, screenshot_enabled={screenshot_enabled}, screenshot_dir={screenshot_dir}, nav_timeout_ms={nav_timeout_ms}, action_timeout_ms={action_timeout_ms}")
-        enabled_platforms = list(MonitorPlatform.objects.filter(enabled=True).order_by("id"))
+        enabled_platforms = _enabled_platforms_for_domain(domain)
         candidates = [platform] + [p for p in enabled_platforms if p.id != platform.id]
         last_err = None
         used_platform = None
@@ -491,9 +666,11 @@ def _execute_task(waiting_task: MonitorWaitingTask):
                     action_timeout_ms=action_timeout_ms,
                 )
                 used_platform = p
+                _mark_platform_success(p)
                 break
             except Exception as e:
                 last_err = e
+                _mark_platform_failure(p, e)
                 logger.warning(f"平台检测失败将尝试切换平台: domain={domain} platform={p} error={type(e).__name__}: {e}")
         if results is None or used_platform is None:
             raise last_err or RuntimeError("all platforms failed")
@@ -549,20 +726,25 @@ def _execute_task(waiting_task: MonitorWaitingTask):
         if incomplete:
             logger.info(f"跳过告警: domain={domain} itdog_stats={meta.get('itdog_stats') if isinstance(meta, dict) else None}")
         elif rate1 > threshold:
-            time.sleep(2)
-            retest_platform = _select_retest_platform(platform, domain)
-            retest_task, total2, failed2, rate2 = _run_one_check(
-                platform=retest_platform,
-                domain=domain,
-                proxy=proxy,
-                headless=headless,
-                screenshot_enabled=screenshot_enabled,
-                screenshot_dir=screenshot_dir,
-                nav_timeout_ms=nav_timeout_ms,
-                action_timeout_ms=action_timeout_ms,
+            diagnosis = _run_dns_diagnosis(domain, waiting_task, task)
+            registrar_confirmed = (
+                diagnosis
+                and diagnosis.diagnosis_type
+                in {
+                    MonitorDomainDiagnosis.DiagnosisType.REGISTRAR_DNS_SUSPENDED,
+                    MonitorDomainDiagnosis.DiagnosisType.REGISTRAR_HOLD,
+                }
+                and float(diagnosis.confidence or 0.0) >= _get_float("REGISTRAR_ALERT_MIN_CONFIDENCE", 0.8)
             )
-            if retest_task.status == "failed":
-                time.sleep(2)
+            if registrar_confirmed:
+                msg = _format_registrar_alert_message(domain, diagnosis)
+                ok = _send_telegram_message(msg)
+                logger.info(f"注册商暂停解析告警发送结果: ok={ok} domain={domain}")
+                _record_alerted_domain(domain, diagnosis.diagnosis_type, f"confidence={diagnosis.confidence:.2f}")
+            else:
+                # 只有 DNS 证据不足或不属于注册商暂停解析时，才继续消耗第三方平台配额做 HTTP 复测。
+                _sleep_confirm_delay(_get_int("CONFIRM_RETEST_DELAY_SECONDS", 30))
+                retest_platform = _select_retest_platform(platform, domain)
                 retest_task, total2, failed2, rate2 = _run_one_check(
                     platform=retest_platform,
                     domain=domain,
@@ -573,9 +755,8 @@ def _execute_task(waiting_task: MonitorWaitingTask):
                     nav_timeout_ms=nav_timeout_ms,
                     action_timeout_ms=action_timeout_ms,
                 )
-                if retest_task.status == "failed" and retest_platform.id != platform.id:
-                    time.sleep(2)
-                    retest_platform = platform
+                if retest_task.status == "failed":
+                    _sleep_confirm_delay(_get_int("CONFIRM_RETEST_DELAY_SECONDS", 30))
                     retest_task, total2, failed2, rate2 = _run_one_check(
                         platform=retest_platform,
                         domain=domain,
@@ -586,26 +767,40 @@ def _execute_task(waiting_task: MonitorWaitingTask):
                         nav_timeout_ms=nav_timeout_ms,
                         action_timeout_ms=action_timeout_ms,
                     )
+                    if retest_task.status == "failed" and retest_platform.id != platform.id:
+                        _sleep_confirm_delay(_get_int("CONFIRM_RETEST_DELAY_SECONDS", 30))
+                        retest_platform = platform
+                        retest_task, total2, failed2, rate2 = _run_one_check(
+                            platform=retest_platform,
+                            domain=domain,
+                            proxy=proxy,
+                            headless=headless,
+                            screenshot_enabled=screenshot_enabled,
+                            screenshot_dir=screenshot_dir,
+                            nav_timeout_ms=nav_timeout_ms,
+                            action_timeout_ms=action_timeout_ms,
+                        )
 
-            logger.info(
-                f"复测失败率计算: domain={domain} task_id={retest_task.id} total={total2} failed={failed2} rate={rate2:.4f} threshold={threshold}"
-            )
-
-            if rate2 > threshold:
-                msg = _format_alert_message(
-                    domain,
-                    threshold=threshold,
-                    total=total2 or total1,
-                    rate1=rate1,
-                    rate2=rate2,
-                    primary_platform=str(platform.platform),
-                    retest_platform=str(retest_platform.platform),
+                logger.info(
+                    f"复测失败率计算: domain={domain} task_id={retest_task.id} total={total2} failed={failed2} rate={rate2:.4f} threshold={threshold}"
                 )
-                ok = _send_telegram_message(msg)
-                logger.info(f"告警发送结果: ok={ok} domain={domain}")
 
-                alert_info = f"{str(platform.platform)}: {rate1 * 100:.2f}% → {str(retest_platform.platform)}: {rate2 * 100:.2f}%"
-                _record_alerted_domain(domain, "fail_rate", alert_info)
+                if rate2 > threshold:
+                    msg = _format_alert_message(
+                        domain,
+                        threshold=threshold,
+                        total=total2 or total1,
+                        rate1=rate1,
+                        rate2=rate2,
+                        primary_platform=str(platform.platform),
+                        retest_platform=str(retest_platform.platform),
+                    )
+                    ok = _send_telegram_message(msg)
+                    logger.info(f"告警发送结果: ok={ok} domain={domain}")
+
+                    diag_info = f", dns={diagnosis.diagnosis_type}:{diagnosis.confidence:.2f}" if diagnosis else ""
+                    alert_info = f"{str(platform.platform)}: {rate1 * 100:.2f}% → {str(retest_platform.platform)}: {rate2 * 100:.2f}%{diag_info}"
+                    _record_alerted_domain(domain, "fail_rate", alert_info)
 
         waiting_task.status = "success"
         waiting_task.error_message = ""
