@@ -1,6 +1,8 @@
 from django.test import SimpleTestCase
 
+from monitor.models import MonitorDomainDiagnosis
 from monitor.dns_diagnosis import QTYPE_A, QTYPE_NS, classify_dns_evidence, normalize_hostname
+from monitor.management.commands.worker import _format_alert_message, _format_dns_misconfig_alert_message
 
 
 class DomainDiagnosisTests(SimpleTestCase):
@@ -54,3 +56,47 @@ class DomainDiagnosisTests(SimpleTestCase):
             registrar_ns_patterns=["juming"],
         )
         self.assertEqual(result.diagnosis_type, "http_only_failure")
+
+    def test_dns_misconfig_alert_message_uses_chinese_diagnosis(self):
+        diagnosis = MonitorDomainDiagnosis(
+            domain="https://example.com",
+            diagnosis_type=MonitorDomainDiagnosis.DiagnosisType.DNS_MISCONFIG,
+            confidence=0.65,
+            evidence={
+                "address_failures": ["SERVFAIL", "REFUSED"],
+                "address_results": [
+                    {"resolver": "1.1.1.1", "rcode": "SERVFAIL"},
+                    {"resolver": "8.8.8.8", "rcode": "REFUSED"},
+                ],
+                "ns_names": ["ns1.example-dns.com"],
+            },
+        )
+
+        msg = _format_dns_misconfig_alert_message("https://example.com", diagnosis)
+
+        self.assertIn("DNS 配置异常，解析服务不可用", msg)
+        self.assertIn("DNS诊断=DNS 配置异常", msg)
+        self.assertIn("SERVFAIL", msg)
+        self.assertIn("1.1.1.1", msg)
+
+    def test_fail_rate_alert_message_includes_dns_summary_when_present(self):
+        diagnosis = MonitorDomainDiagnosis(
+            domain="https://example.com/not-exist",
+            diagnosis_type=MonitorDomainDiagnosis.DiagnosisType.HTTP_ONLY_FAILURE,
+            confidence=0.75,
+            evidence={},
+        )
+
+        msg = _format_alert_message(
+            "https://example.com/not-exist",
+            threshold=0.3,
+            total=36,
+            rate1=1.0,
+            rate2=1.0,
+            primary_platform="chinaz",
+            retest_platform="itdog",
+            diagnosis=diagnosis,
+        )
+
+        self.assertIn("DNS诊断: HTTP 访问异常", msg)
+        self.assertIn("DNS 可解析", msg)

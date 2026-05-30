@@ -222,11 +222,18 @@ def _format_alert_message(
     rate2: float,
     primary_platform: str,
     retest_platform: str,
+    diagnosis: MonitorDomainDiagnosis | None = None,
 ):
     ts = timezone.localtime(timezone.now()).strftime("%Y-%m-%d %H:%M:%S")
     threshold_pct = int(round(threshold * 100))
     rate1_pct = f"{rate1 * 100:.2f}%"
     rate2_pct = f"{rate2 * 100:.2f}%"
+    diagnosis_line = ""
+    if diagnosis:
+        diagnosis_line = (
+            f"\nDNS诊断: {diagnosis.diagnosis_type_cn}, "
+            f"置信度={diagnosis.confidence:.2f}, 说明={diagnosis.diagnosis_summary}"
+        )
     return (
         f"🔥🔥🔥报警实例:  {domain}\n\n"
         f"名称: 域名失败率 > {threshold_pct}% (监控节点数 {total} )\n"
@@ -234,6 +241,7 @@ def _format_alert_message(
         f"级别： Critical\n"
         f"状态: PROBLEM\n"
         f"详情: {domain} 检测失败 ,{primary_platform}:{rate1_pct} -> {retest_platform}:{rate2_pct}"
+        f"{diagnosis_line}"
     )
 
 
@@ -253,6 +261,27 @@ def _format_registrar_alert_message(domain: str, diagnosis: MonitorDomainDiagnos
         f"状态: PROBLEM\n"
         f"详情: {domain} DNS 诊断={diagnosis.diagnosis_type}, 置信度={diagnosis.confidence:.2f}, "
         f"NS={ns_names}, DNS失败={failures}"
+    )
+
+
+def _format_dns_misconfig_alert_message(domain: str, diagnosis: MonitorDomainDiagnosis):
+    ts = timezone.localtime(timezone.now()).strftime("%Y-%m-%d %H:%M:%S")
+    evidence = diagnosis.evidence or {}
+    ns_names = ", ".join((evidence.get("ns_names") or [])[:6]) or "-"
+    failures = ", ".join(sorted(set(evidence.get("address_failures") or []))) or "-"
+    resolvers = evidence.get("resolvers") or [
+        row.get("resolver") for row in (evidence.get("address_results") or []) if row.get("resolver")
+    ]
+    resolvers = ", ".join([str(v) for v in sorted(set(resolvers))[:6]]) or "-"
+    return (
+        f"🔥🔥🔥报警实例:  {domain}\n\n"
+        f"名称: DNS 配置异常，解析服务不可用\n"
+        f"时间: {ts}\n"
+        f"级别： Critical\n"
+        f"状态: PROBLEM\n"
+        f"详情: {domain} DNS诊断={diagnosis.diagnosis_type_cn}, 置信度={diagnosis.confidence:.2f}, "
+        f"DNS失败={failures}, NS={ns_names}, 解析器={resolvers}\n"
+        f"说明: {diagnosis.diagnosis_summary}"
     )
 
 
@@ -736,13 +765,23 @@ def _execute_task(waiting_task: MonitorWaitingTask):
                 }
                 and float(diagnosis.confidence or 0.0) >= _get_float("REGISTRAR_ALERT_MIN_CONFIDENCE", 0.8)
             )
+            dns_misconfig_confirmed = (
+                diagnosis
+                and diagnosis.diagnosis_type == MonitorDomainDiagnosis.DiagnosisType.DNS_MISCONFIG
+                and float(diagnosis.confidence or 0.0) >= _get_float("DNS_ALERT_MIN_CONFIDENCE", 0.6)
+            )
             if registrar_confirmed:
                 msg = _format_registrar_alert_message(domain, diagnosis)
                 ok = _send_telegram_message(msg)
                 logger.info(f"注册商暂停解析告警发送结果: ok={ok} domain={domain}")
                 _record_alerted_domain(domain, diagnosis.diagnosis_type, f"confidence={diagnosis.confidence:.2f}")
+            elif dns_misconfig_confirmed:
+                msg = _format_dns_misconfig_alert_message(domain, diagnosis)
+                ok = _send_telegram_message(msg)
+                logger.info(f"DNS 配置异常告警发送结果: ok={ok} domain={domain}")
+                _record_alerted_domain(domain, diagnosis.diagnosis_type, f"confidence={diagnosis.confidence:.2f}")
             else:
-                # 只有 DNS 证据不足或不属于注册商暂停解析时，才继续消耗第三方平台配额做 HTTP 复测。
+                # 只有 DNS 证据不足或不是明确 DNS/注册商异常时，才继续消耗第三方平台配额做 HTTP 复测。
                 _sleep_confirm_delay(_get_int("CONFIRM_RETEST_DELAY_SECONDS", 30))
                 retest_platform = _select_retest_platform(platform, domain)
                 retest_task, total2, failed2, rate2 = _run_one_check(
@@ -794,6 +833,7 @@ def _execute_task(waiting_task: MonitorWaitingTask):
                         rate2=rate2,
                         primary_platform=str(platform.platform),
                         retest_platform=str(retest_platform.platform),
+                        diagnosis=diagnosis,
                     )
                     ok = _send_telegram_message(msg)
                     logger.info(f"告警发送结果: ok={ok} domain={domain}")
