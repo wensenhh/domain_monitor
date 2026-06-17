@@ -8,6 +8,7 @@ TEST_DOMAINS="${TEST_DOMAINS:-example.com,www.cloudflare.com,www.google.com}"
 RUN_CHECKS="${RUN_CHECKS:-1}"
 WORKER_RUNS="${WORKER_RUNS:-1}"
 FORCE_ALERT_TEST="${FORCE_ALERT_TEST:-1}"
+BOOTSTRAP_REQUIRE_TELEGRAM="${BOOTSTRAP_REQUIRE_TELEGRAM:-1}"
 
 HEADLESS="${HEADLESS:-true}"
 DEFAULT_PROXY="${DEFAULT_PROXY:-}"
@@ -44,6 +45,7 @@ Environment variables:
   RUN_CHECKS=1                 # set 0 to only write config/domains
   WORKER_RUNS=1                # number of worker --once executions
   FORCE_ALERT_TEST=1           # send a simulated alert and write alert table
+  BOOTSTRAP_REQUIRE_TELEGRAM=1 # fail fast when Telegram config is missing
   TG_BOT_TOKEN=<required for Telegram test>
   TG_CHAT_ID=<required for Telegram test>
   TELEGRAM_SENDER_API_KEY=<optional>
@@ -91,6 +93,47 @@ compose() {
 
 require_service() {
   compose ps "$DJANGO_SERVICE" >/dev/null 2>&1 || die "compose service not found: $DJANGO_SERVICE"
+}
+
+config_value() {
+  local key="$1"
+  compose exec -T -e "BOOT_CONFIG_KEY=${key}" "$DJANGO_SERVICE" python devops_django_server/manage.py shell <<'PY' | tail -n 1
+import os
+from monitor.models import MonitorConfig
+
+key = os.environ["BOOT_CONFIG_KEY"]
+row = MonitorConfig.objects.filter(key=key).first()
+if not row:
+    print("")
+elif row.value_type == MonitorConfig.ValueType.BOOL:
+    print("true" if row.value_bool else "false")
+elif row.value_type == MonitorConfig.ValueType.INT:
+    print("" if row.value_int is None else row.value_int)
+elif row.value_type == MonitorConfig.ValueType.FLOAT:
+    print("" if row.value_float is None else row.value_float)
+elif row.value_type == MonitorConfig.ValueType.JSON:
+    print("" if row.value_json is None else row.value_json)
+else:
+    print(row.value_str or "")
+PY
+}
+
+require_telegram_settings() {
+  if [[ -z "$TG_BOT_TOKEN" ]]; then
+    TG_BOT_TOKEN="$(config_value TG_BOT_TOKEN || true)"
+  fi
+  if [[ -z "$TG_CHAT_ID" ]]; then
+    TG_CHAT_ID="$(config_value TG_CHAT_ID || true)"
+  fi
+  if [[ -z "$TELEGRAM_SENDER_API_KEY" ]]; then
+    TELEGRAM_SENDER_API_KEY="$(config_value TELEGRAM_SENDER_API_KEY || true)"
+  fi
+
+  if [[ "$BOOTSTRAP_REQUIRE_TELEGRAM" == "1" && "$RUN_CHECKS" == "1" ]]; then
+    if [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]]; then
+      die "Telegram config is missing. Re-run with TG_BOT_TOKEN='<token>' TG_CHAT_ID='<chat_id>' or add TG_BOT_TOKEN/TG_CHAT_ID in MonitorConfig."
+    fi
+  fi
 }
 
 seed_config_and_domains() {
@@ -208,11 +251,6 @@ PY
 }
 
 send_telegram_test() {
-  if [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]]; then
-    log "TG_BOT_TOKEN or TG_CHAT_ID is empty; skip Telegram push test."
-    return
-  fi
-
   log "Sending Telegram test message through /monitor/telegram_sender."
   compose exec -T \
     -e "BOOT_TG_BOT_TOKEN=${TG_BOT_TOKEN}" \
@@ -259,11 +297,6 @@ PY
 send_forced_alert_test() {
   if [[ "$FORCE_ALERT_TEST" != "1" ]]; then
     log "FORCE_ALERT_TEST=0, skip simulated alert push test."
-    return
-  fi
-
-  if [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]]; then
-    log "TG_BOT_TOKEN or TG_CHAT_ID is empty; skip simulated alert push test."
     return
   fi
 
@@ -332,6 +365,7 @@ PY
 
 main() {
   require_service
+  require_telegram_settings
   seed_config_and_domains
   if [[ "$RUN_CHECKS" == "1" ]]; then
     send_telegram_test
