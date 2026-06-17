@@ -212,6 +212,52 @@ ensure_compose() {
   docker compose version >/dev/null 2>&1 || die "Docker Compose v2 install failed."
 }
 
+install_buildx_plugin_package() {
+  if command_exists apt-get; then
+    apt-get update -y
+    apt-get install -y docker-buildx-plugin && return 0
+  elif command_exists dnf; then
+    dnf install -y docker-buildx-plugin && return 0
+  elif command_exists yum; then
+    yum install -y docker-buildx-plugin && return 0
+  fi
+  return 1
+}
+
+buildx_arch() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    *) die "Unsupported CPU architecture for Docker Buildx plugin: $arch" ;;
+  esac
+}
+
+install_buildx_plugin_binary() {
+  local version="${BUILDX_VERSION:-v0.19.3}"
+  local arch
+  arch="$(buildx_arch)"
+
+  local plugin_dir="/usr/local/lib/docker/cli-plugins"
+  mkdir -p "$plugin_dir"
+  log "Installing Docker Buildx plugin ${version} from GitHub releases."
+  curl -fsSL "https://github.com/docker/buildx/releases/download/${version}/buildx-${version}.linux-${arch}" \
+    -o "${plugin_dir}/docker-buildx"
+  chmod +x "${plugin_dir}/docker-buildx"
+}
+
+ensure_buildx() {
+  if docker buildx version >/dev/null 2>&1; then
+    return
+  fi
+
+  log "Docker Buildx plugin not found. Installing buildx plugin."
+  install_buildx_plugin_package || install_buildx_plugin_binary
+
+  docker buildx version >/dev/null 2>&1 || die "Docker Buildx plugin install failed."
+}
+
 git_cmd() {
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GITHUB_TOKEN}" "$@"
@@ -451,6 +497,7 @@ main() {
   ensure_basic_tools
   ensure_docker
   ensure_compose
+  ensure_buildx
   sync_repo
 
   cd "$INSTALL_DIR"
