@@ -70,6 +70,21 @@ bash /tmp/deploy-domain-monitor.sh
 
 脚本默认安装到 `/opt/domain_monitor`，默认只启动 2 个 worker。需要更多 worker 时可以设置 `WORKERS=4` 到 `WORKERS=16`。
 
+如果你想在后台已经登录后，一次性补配置、加测试域名并跑验收，可以执行：
+
+```bash
+cd /opt/domain_monitor
+TG_BOT_TOKEN='新的机器人 token' \
+TG_CHAT_ID='你的 chat id' \
+bash scripts/bootstrap_monitor.sh
+```
+
+只写配置和测试域名，不跑告警和采集：
+
+```bash
+RUN_CHECKS=0 bash scripts/bootstrap_monitor.sh
+```
+
 ## 3. 拉取代码
 
 ```bash
