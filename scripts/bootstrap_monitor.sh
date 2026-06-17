@@ -7,6 +7,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/domain_monitor}"
 TEST_DOMAINS="${TEST_DOMAINS:-example.com,www.cloudflare.com,www.google.com}"
 RUN_CHECKS="${RUN_CHECKS:-1}"
 WORKER_RUNS="${WORKER_RUNS:-1}"
+FORCE_ALERT_TEST="${FORCE_ALERT_TEST:-1}"
 
 HEADLESS="${HEADLESS:-true}"
 DEFAULT_PROXY="${DEFAULT_PROXY:-}"
@@ -26,6 +27,7 @@ TELEGRAM_SENDER_URL="${TELEGRAM_SENDER_URL:-}"
 TELEGRAM_SENDER_API_KEY="${TELEGRAM_SENDER_API_KEY:-}"
 DJANGO_SERVER_PORT="${DJANGO_SERVER_PORT:-8001}"
 TEST_TELEGRAM_TEXT="${TEST_TELEGRAM_TEXT:-devops-monitor bootstrap telegram test}"
+TEST_ALERT_DOMAIN="${TEST_ALERT_DOMAIN:-bootstrap-alert-test.invalid}"
 
 usage() {
   cat <<EOF
@@ -41,6 +43,7 @@ Environment variables:
   TEST_DOMAINS=example.com,www.cloudflare.com,www.google.com
   RUN_CHECKS=1                 # set 0 to only write config/domains
   WORKER_RUNS=1                # number of worker --once executions
+  FORCE_ALERT_TEST=1           # send a simulated alert and write alert table
   TG_BOT_TOKEN=<required for Telegram test>
   TG_CHAT_ID=<required for Telegram test>
   TELEGRAM_SENDER_API_KEY=<optional>
@@ -253,6 +256,47 @@ if not obj.get("ok"):
 PY
 }
 
+send_forced_alert_test() {
+  if [[ "$FORCE_ALERT_TEST" != "1" ]]; then
+    log "FORCE_ALERT_TEST=0, skip simulated alert push test."
+    return
+  fi
+
+  if [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]]; then
+    log "TG_BOT_TOKEN or TG_CHAT_ID is empty; skip simulated alert push test."
+    return
+  fi
+
+  log "Sending simulated alert through worker alert sender."
+  compose exec -T \
+    -e "BOOT_TEST_ALERT_DOMAIN=${TEST_ALERT_DOMAIN}" \
+    "$DJANGO_SERVICE" python devops_django_server/manage.py shell <<'PY'
+import os
+from django.utils import timezone
+
+from monitor.management.commands.worker import (
+    _record_alerted_domain,
+    _send_telegram_message,
+)
+
+domain = os.environ.get("BOOT_TEST_ALERT_DOMAIN", "bootstrap-alert-test.invalid")
+ts = timezone.localtime(timezone.now()).strftime("%Y-%m-%d %H:%M:%S")
+msg = (
+    f"🔥🔥🔥报警实例:  {domain}\n\n"
+    "名称: 告警链路测试 > 30% (监控节点数 1 )\n"
+    f"时间: {ts}\n"
+    "级别： Critical\n"
+    "状态: PROBLEM\n"
+    "详情: 这是一条 bootstrap 模拟告警，用于验证 Telegram 告警推送和告警表入库"
+)
+ok = bool(_send_telegram_message(msg))
+print(f"forced_alert_send_ok={ok}")
+_record_alerted_domain(domain, "bootstrap_alert_test", "simulated alert push test")
+if not ok:
+    raise SystemExit(3)
+PY
+}
+
 run_monitor_smoke() {
   log "Running producer --once."
   compose exec -T "$DJANGO_SERVICE" python devops_django_server/manage.py producer --once
@@ -291,6 +335,7 @@ main() {
   seed_config_and_domains
   if [[ "$RUN_CHECKS" == "1" ]]; then
     send_telegram_test
+    send_forced_alert_test
     run_monitor_smoke
   else
     log "RUN_CHECKS=0, skipped Telegram and monitor smoke tests."

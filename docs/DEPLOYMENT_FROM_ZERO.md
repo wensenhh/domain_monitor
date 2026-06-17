@@ -79,6 +79,8 @@ TG_CHAT_ID='你的 chat id' \
 bash scripts/bootstrap_monitor.sh
 ```
 
+说明：真实监控告警只有在首测失败率和复测失败率都超过 `ALERT_FAIL_THRESHOLD` 时才会发送。`bootstrap_monitor.sh` 默认带 `FORCE_ALERT_TEST=1`，会额外发送一条“告警链路测试”消息并写入告警表，用于确认 Telegram 告警通道可用。
+
 只写配置和测试域名，不跑告警和采集：
 
 ```bash
